@@ -23,6 +23,11 @@ that does *not* change across different connections.  The daemon then looks for
 a valid socket every time it receives a request and forwards the request to the
 real forwarded agent.
 
+Additionally, when starting the agent you can also explicitly list paths to preferred
+local agents (such as the one provided by [1Password's ssh agent](https://developer.1password.com/docs/ssh/agent/)
+which will be used if a local user is detected as active based on
+keyboard/mouse activity.
+
 ## Installation
 
 ssh-agent-switcher is written in Go and has no dependencies.  You can build it
@@ -56,6 +61,32 @@ if [ ! -e "/tmp/ssh-agent.${USER}" ]; then
         disown 2>/dev/null || true
     fi
 fi
+export SSH_AUTH_SOCK="/tmp/ssh-agent.${USER}"
+```
+
+if using with 1Password's SSH agent, use the following instead:
+
+```sh
+# Define the 1Password SSH agent socket path
+ONEPASS_AGENT_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+
+if [ ! -e "/tmp/ssh-agent.${USER}" ]; then
+    # Base command
+    SSH_AGENT_CMD="$HOME/.local/bin/ssh-agent-switcher"
+
+    # Add 1Password agent argument if socket exists
+    if [ -e "$ONEPASS_AGENT_SOCK" ]; then
+        SSH_AGENT_CMD="$SSH_AGENT_CMD -local-agent \"$ONEPASS_AGENT_SOCK\""
+    fi
+
+    if [ -n "${ZSH_VERSION}" ]; then
+        eval "$SSH_AGENT_CMD" 2>/dev/null "&!"
+    else
+        eval "$SSH_AGENT_CMD" 2>/dev/null &
+        disown 2>/dev/null || true
+    fi
+fi
+
 export SSH_AUTH_SOCK="/tmp/ssh-agent.${USER}"
 ```
 

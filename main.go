@@ -38,12 +38,42 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
+)
+
+const (
+	// if the keyboard/mouse has not been active on the local machine for longer than this
+	// threshold, the machine is considered "idle" and switcher should prefer any remotely
+	// connected agent instead.
+	defaultIdleThreshold = 30 * time.Second
 )
 
 var (
-	socketPath = flag.String("socketPath", defaultSocketPath(), "path to the socket to listen on")
-	agentsDir  = flag.String("agentsDir", "/tmp", "directory where to look for running agents")
+	socketPath    = flag.String("socket-path", defaultSocketPath(), "path to the socket to listen on")
+	agentsDir     = flag.String("agents-dir", "/tmp", "directory where to look for running agents")
+	idleThreshold = flag.Duration("idle-threshold", defaultIdleThreshold, "prefer local agents if local keyboard/mouse activity within idle time")
 )
+
+var (
+	addtlAgents arrayFlags
+)
+
+func init() {
+	flag.Var(&addtlAgents, "local-agent", "Additional local agent socket paths (can be repeated)")
+}
+
+type arrayFlags []string
+
+// Implement the String method of the flag.Value interface.
+func (i *arrayFlags) String() string {
+	return strings.Join(*i, ", ")
+}
+
+// Implement the Set method of the flag.Value interface.
+func (i *arrayFlags) Set(value string) error {
+	*i = append(*i, value)
+	return nil
+}
 
 // defaultSocketPath computes the name of the default value for the socketPath flag.
 func defaultSocketPath() string {
@@ -70,33 +100,37 @@ func findAgentSocketSubdir(dir string) (net.Conn, error) {
 		path := filepath.Join(dir, entry.Name())
 
 		if !strings.HasPrefix(entry.Name(), "agent.") {
-			log.Printf("Ignoring %s: does not start with 'agent.'\n", path)
+			log.Printf("Ignoring %s: does not start with 'agent.'", path)
 			continue
 		}
-
-		fi, err := os.Stat(path)
-		if err != nil {
-			log.Printf("Ignoring %s: stat failed: %v\n", path, err)
-			continue
+		conn, err := checkSocket(path)
+		if err == nil {
+			return conn, nil
 		}
+		log.Print(err)
+	}
+	return nil, errors.New("no socket in directory")
+}
 
-		mode := fi.Sys().(*syscall.Stat_t).Mode
-		if (mode & syscall.S_IFSOCK) == 0 {
-			log.Printf("Ignoring %s: not a socket\n", path)
-			continue
-		}
-
-		conn, err := net.Dial("unix", path)
-		if err != nil {
-			log.Printf("Ignoring %s: open failed: %v\n", path, err)
-			continue
-		}
-
-		log.Printf("Successfully opened SSH agent at %s", path)
-		return conn, nil
+func checkSocket(path string) (net.Conn, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("Ignoring %s: stat failed: %v", path, err)
 	}
 
-	return nil, errors.New("no socket in directory")
+	mode := fi.Sys().(*syscall.Stat_t).Mode
+	if (mode & syscall.S_IFSOCK) == 0 {
+		return nil, fmt.Errorf("Ignoring %s: not a socket", path)
+	}
+
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("Ignoring %s: open failed: %v", path, err)
+	}
+
+	log.Printf("Successfully opened SSH agent at %s", path)
+	return conn, nil
+
 }
 
 // findAgentSocket scans the contents of "dir", which should point to the directory where
@@ -127,18 +161,18 @@ func findAgentSocket(dir string) (net.Conn, error) {
 		path := filepath.Join(dir, entry.Name())
 
 		if !entry.IsDir() {
-			log.Printf("Ignoring %s: not a directory\n", path)
+			log.Printf("Ignoring %s: not a directory", path)
 			continue
 		}
 
 		if !strings.HasPrefix(entry.Name(), "ssh-") {
-			log.Printf("Ignoring %s: does not start with 'ssh-'\n", path)
+			log.Printf("Ignoring %s: does not start with 'ssh-'", path)
 			continue
 		}
 
 		fi, err := os.Stat(path)
 		if err != nil {
-			log.Printf("Ignoring %s: stat failed: %v\n", path, err)
+			log.Printf("Ignoring %s: stat failed: %v", path, err)
 			continue
 		}
 
@@ -146,13 +180,13 @@ func findAgentSocket(dir string) (net.Conn, error) {
 		// would simply fail to open them later anyway.
 		uid := fi.Sys().(*syscall.Stat_t).Uid
 		if int(uid) != ourUid {
-			log.Printf("Ignoring %s: owner %d is not current user %d\n", path, uid, ourUid)
+			log.Printf("Ignoring %s: owner %d is not current user %d", path, uid, ourUid)
 			continue
 		}
 
 		agent, err := findAgentSocketSubdir(path)
 		if err != nil {
-			log.Printf("Ignoring %s: %v\n", path, err)
+			log.Printf("Ignoring %s: %v", path, err)
 			continue
 		}
 		return agent, nil
@@ -206,21 +240,51 @@ func proxyConnection(client net.Conn, agent net.Conn) error {
 	return nil
 }
 
+func isLocalActive() bool {
+	idleTime, err := getIdleTime()
+	if err != nil {
+		log.Println(err)
+		return false
+	}
+	isActive := idleTime < *idleThreshold
+	log.Printf("idletime=%s threshold=%s isactive=%t", idleTime, *idleThreshold, isActive)
+	return isActive
+}
+
 // handleConnection receives a connection from the client, looks for an sshd serving an agent,
 // and proxies the connection to it.
 func handleConnection(client net.Conn) {
 	log.Printf("Accepted client connection")
 	defer client.Close()
 
-	agent, err := findAgentSocket(*agentsDir)
+	var agent net.Conn
+	var err error
+
+	agent, err = findAgentSocket(*agentsDir)
 	if err != nil {
-		log.Printf("Dropping connection: %v", err)
+		log.Printf("Dropping find connection: %v", err)
+	}
+
+	if agent == nil || isLocalActive() {
+		for _, path := range addtlAgents {
+			localAgent, err := checkSocket(path)
+			if err == nil {
+				agent = localAgent
+				log.Println("Using local agent")
+				break
+			}
+			log.Println("Additonal local socket check failed: %v", err)
+		}
+	}
+
+	if agent == nil {
 		return
 	}
+
 	defer agent.Close()
 
 	if err := proxyConnection(client, agent); err != nil {
-		log.Printf("Dropping connection: %v", err)
+		log.Printf("Dropping proxy connection: %v", err)
 		return
 	}
 	log.Printf("Closing client connection")
@@ -237,7 +301,7 @@ func setupSignals(socketPath string) {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		log.Printf("Shutting down due to signal and deleting %s\n", socketPath)
+		log.Printf("Shutting down due to signal and deleting %s", socketPath)
 		os.Remove(socketPath)
 		os.Exit(1)
 	}()
