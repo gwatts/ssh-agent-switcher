@@ -331,11 +331,29 @@ func setupSignals(socketPath string) {
 	}()
 }
 
+func usage() {
+	prog := filepath.Base(os.Args[0])
+	fmt.Fprintf(os.Stderr, `Usage: %s [flags]
+
+ssh-agent-switcher serves a Unix domain socket that proxies connections to any valid SSH agent
+socket provided by sshd. It automatically switches between local and remote SSH agents based
+on system idle time.
+
+Flags:
+`, prog)
+	flag.PrintDefaults()
+	os.Exit(2)
+}
+
+func init() {
+	flag.Usage = usage
+}
+
 func main() {
 	flag.Parse()
 	if len(flag.Args()) != 0 {
 		fmt.Fprint(os.Stderr, "No arguments allowed")
-		os.Exit(1)
+		usage()
 	}
 
 	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
