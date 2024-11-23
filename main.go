@@ -30,7 +30,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -52,6 +52,7 @@ var (
 	socketPath    = flag.String("socket-path", defaultSocketPath(), "path to the socket to listen on")
 	agentsDir     = flag.String("agents-dir", "/tmp", "directory where to look for running agents")
 	idleThreshold = flag.Duration("idle-threshold", defaultIdleThreshold, "prefer local agents if local keyboard/mouse activity within idle time")
+	logLevel      = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 )
 
 var (
@@ -73,6 +74,22 @@ func (i *arrayFlags) String() string {
 func (i *arrayFlags) Set(value string) error {
 	*i = append(*i, value)
 	return nil
+}
+
+// parseLogLevel converts a string level to slog.Level
+func parseLogLevel(level string) slog.Level {
+	switch strings.ToLower(level) {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo // default to Info
+	}
 }
 
 // defaultSocketPath computes the name of the default value for the socketPath flag.
@@ -100,14 +117,14 @@ func findAgentSocketSubdir(dir string) (net.Conn, error) {
 		path := filepath.Join(dir, entry.Name())
 
 		if !strings.HasPrefix(entry.Name(), "agent.") {
-			log.Printf("Ignoring %s: does not start with 'agent.'", path)
+			slog.Debug("Ignoring filename that does not start with \"agent.\"", slog.String("path", path))
 			continue
 		}
 		conn, err := checkSocket(path)
 		if err == nil {
 			return conn, nil
 		}
-		log.Print(err)
+		slog.Debug("skip file", slog.Any("reason", err))
 	}
 	return nil, errors.New("no socket in directory")
 }
@@ -128,7 +145,7 @@ func checkSocket(path string) (net.Conn, error) {
 		return nil, fmt.Errorf("Ignoring %s: open failed: %v", path, err)
 	}
 
-	log.Printf("Successfully opened SSH agent at %s", path)
+	slog.Info("Successfully opened SSH agent", slog.String("path", path))
 	return conn, nil
 
 }
@@ -161,18 +178,18 @@ func findAgentSocket(dir string) (net.Conn, error) {
 		path := filepath.Join(dir, entry.Name())
 
 		if !entry.IsDir() {
-			log.Printf("Ignoring %s: not a directory", path)
+			slog.Debug("Ignoring: not a directory", slog.String("path", path))
 			continue
 		}
 
 		if !strings.HasPrefix(entry.Name(), "ssh-") {
-			log.Printf("Ignoring %s: does not start with 'ssh-'", path)
+			slog.Debug("Ignoring: does not start with 'ssh-'", slog.String("path", path))
 			continue
 		}
 
 		fi, err := os.Stat(path)
 		if err != nil {
-			log.Printf("Ignoring %s: stat failed: %v", path, err)
+			slog.Debug("Ignoring: stat failed", slog.String("path", path), slog.Any("error", err))
 			continue
 		}
 
@@ -180,13 +197,15 @@ func findAgentSocket(dir string) (net.Conn, error) {
 		// would simply fail to open them later anyway.
 		uid := fi.Sys().(*syscall.Stat_t).Uid
 		if int(uid) != ourUid {
-			log.Printf("Ignoring %s: owner %d is not current user %d", path, uid, ourUid)
+			slog.Debug("Ignoring: owner %d is not current user %d",
+				slog.String("path", path),
+				slog.Int("file_uid", int(uid)), slog.Int("our_uid", int(ourUid)))
 			continue
 		}
 
 		agent, err := findAgentSocketSubdir(path)
 		if err != nil {
-			log.Printf("Ignoring %s: %v", path, err)
+			slog.Debug("Ignoring path", slog.String("path", path), slog.Any("reason", err))
 			continue
 		}
 		return agent, nil
@@ -205,7 +224,7 @@ func proxyConnection(client net.Conn, agent net.Conn) error {
 	// fixing this properly would require either spawning extra coroutines which, while they are
 	// cheap, they are tricky to handle; or it would require a way to perform non-blocking reads
 	// from the socket, which is not supported yet: https://github.com/golang/go/issues/15735.
-	buf := make([]byte, 4096)
+	buf := make([]byte, 32768)
 
 	for {
 		n, err := client.Read(buf)
@@ -243,18 +262,21 @@ func proxyConnection(client net.Conn, agent net.Conn) error {
 func isLocalActive() bool {
 	idleTime, err := getIdleTime()
 	if err != nil {
-		log.Println(err)
+		slog.Debug("failed to get local user idle time", slog.Any("error", err))
 		return false
 	}
 	isActive := idleTime < *idleThreshold
-	log.Printf("idletime=%s threshold=%s isactive=%t", idleTime, *idleThreshold, isActive)
+	slog.Info("detected local user idle status",
+		slog.Bool("is_active", isActive),
+		slog.Duration("idle_threshold", *idleThreshold),
+		slog.Duration("current_idle_time", idleTime))
 	return isActive
 }
 
 // handleConnection receives a connection from the client, looks for an sshd serving an agent,
 // and proxies the connection to it.
 func handleConnection(client net.Conn) {
-	log.Printf("Accepted client connection")
+	slog.Info("Accepted client connection")
 	defer client.Close()
 
 	var agent net.Conn
@@ -262,7 +284,7 @@ func handleConnection(client net.Conn) {
 
 	agent, err = findAgentSocket(*agentsDir)
 	if err != nil {
-		log.Printf("Dropping find connection: %v", err)
+		slog.Info("Dropping find connection", slog.Any("reason", err))
 	}
 
 	if agent == nil || isLocalActive() {
@@ -270,10 +292,11 @@ func handleConnection(client net.Conn) {
 			localAgent, err := checkSocket(path)
 			if err == nil {
 				agent = localAgent
-				log.Println("Using local agent")
+				slog.Info("Using local agent")
 				break
 			}
-			log.Println("Additonal local socket check failed: %v", err)
+			slog.Warn("Additional local socket check failed",
+				slog.String("path", path), slog.Any("error", err))
 		}
 	}
 
@@ -284,10 +307,10 @@ func handleConnection(client net.Conn) {
 	defer agent.Close()
 
 	if err := proxyConnection(client, agent); err != nil {
-		log.Printf("Dropping proxy connection: %v", err)
+		slog.Info("Dropping proxy connection", slog.Any("error", err))
 		return
 	}
-	log.Printf("Closing client connection")
+	slog.Info("Closing client connection")
 }
 
 // setupSignals installs signal handlers to clean up files and ignores signals that we don't want
@@ -301,7 +324,8 @@ func setupSignals(socketPath string) {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		log.Printf("Shutting down due to signal and deleting %s", socketPath)
+		slog.Info("Shutting down due to signal and deleting listen socket",
+			slog.String("socket_path", socketPath))
 		os.Remove(socketPath)
 		os.Exit(1)
 	}()
@@ -310,8 +334,15 @@ func setupSignals(socketPath string) {
 func main() {
 	flag.Parse()
 	if len(flag.Args()) != 0 {
-		log.Fatal("No arguments allowed")
+		fmt.Fprint(os.Stderr, "No arguments allowed")
+		os.Exit(1)
 	}
+
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		// Set level from flag
+		Level: parseLogLevel(*logLevel),
+	})
+	slog.SetDefault(slog.New(handler))
 
 	// Install signal handlers before we create the socket so that we don't leave it
 	// behind in any case.
@@ -322,14 +353,16 @@ func main() {
 	syscall.Umask(0177)
 	socket, err := net.Listen("unix", *socketPath)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Fprint(os.Stderr, err)
+		os.Exit(1)
 	}
-	log.Printf("Listening on %s", *socketPath)
+	slog.Info("Listening", slog.String("socket_path", *socketPath))
 
 	for {
 		conn, err := socket.Accept()
 		if err != nil {
-			log.Fatal(err)
+			slog.Error("Socket accept failed", slog.Any("error", err))
+			os.Exit(1)
 		}
 
 		go handleConnection(conn)
