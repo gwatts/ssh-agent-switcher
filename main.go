@@ -37,6 +37,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -94,11 +95,20 @@ func parseLogLevel(level string) slog.Level {
 
 // defaultSocketPath computes the name of the default value for the socketPath flag.
 func defaultSocketPath() string {
-	user := os.Getenv("USER")
-	if user == "" {
-		return ""
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		panic(fmt.Sprintf("failed to get home dir: %v", err))
 	}
-	return fmt.Sprintf("/tmp/ssh-agent.%s", user)
+
+	// Construct the full path
+	socketDir := filepath.Join(homeDir, ".share", "ssh-agent-switcher")
+	socketPath := filepath.Join(socketDir, "ssh-agent.sock")
+
+	// Create directory if it doesn't exist
+	if err = os.MkdirAll(socketDir, 0700); err != nil {
+		panic(fmt.Sprintf("failed to create %s: %v", socketDir, err))
+	}
+	return socketPath
 }
 
 // findAgentSocketSubdir scans the contents of "dir", which should point to a session directory
@@ -217,45 +227,27 @@ func findAgentSocket(dir string) (net.Conn, error) {
 // proxyConnection forwards all request from the client to the agent, and all responses from
 // the agent to the client.
 func proxyConnection(client net.Conn, agent net.Conn) error {
-	// The buffer needs to be large enough to handle any one read or write by the client or
-	// the agent.  Otherwise bad things will happen.
-	//
-	// TODO(jmerino): This could be improved but it's better to keep it simple.  In particular,
-	// fixing this properly would require either spawning extra coroutines which, while they are
-	// cheap, they are tricky to handle; or it would require a way to perform non-blocking reads
-	// from the socket, which is not supported yet: https://github.com/golang/go/issues/15735.
-	buf := make([]byte, 32768)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	for {
-		n, err := client.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				return fmt.Errorf("read from client failed: %v", err)
-			}
-			break
+	// Copy client → agent
+	go func() {
+		defer wg.Done()
+		if _, err := io.Copy(agent, client); err != nil && !errors.Is(err, io.EOF) {
+			slog.Warn("client→agent copy error", "error", err)
 		}
-		if n == 0 {
-			break
-		}
+	}()
 
-		_, err = agent.Write(buf[:n])
-		if err != nil {
-			return fmt.Errorf("write to agent failed: %v", err)
+	// Copy agent → client
+	go func() {
+		defer wg.Done()
+		if _, err := io.Copy(client, agent); err != nil && !errors.Is(err, io.EOF) {
+			slog.Warn("agent→client copy error", "error", err)
 		}
+	}()
 
-		n, err = agent.Read(buf)
-		if err != nil {
-			return fmt.Errorf("read from agent failed: %v", err)
-		}
-
-		if n > 0 {
-			_, err = client.Write(buf[:n])
-			if err != nil {
-				return fmt.Errorf("write to client failed: %v", err)
-			}
-		}
-	}
-
+	// Wait for both copies to finish
+	wg.Wait()
 	return nil
 }
 
@@ -371,7 +363,7 @@ func main() {
 	syscall.Umask(0177)
 	socket, err := net.Listen("unix", *socketPath)
 	if err != nil {
-		fmt.Fprint(os.Stderr, err)
+		slog.Error("Failed to bind to socket", slog.String("socket_path", *socketPath), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 	slog.Info("Listening", slog.String("socket_path", *socketPath))
