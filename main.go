@@ -47,12 +47,18 @@ const (
 	// threshold, the machine is considered "idle" and switcher should prefer any remotely
 	// connected agent instead.
 	defaultIdleThreshold = 30 * time.Second
+
+	// If the ssh-agent has not completed a response in this time limit, then the connection
+	// is dropped.   This prevents processes being stuck in a  hung state as no-one was at the right
+	// machine to approve the request.
+	defaultConnTimeout = 10 * time.Second
 )
 
 var (
 	socketPath    = flag.String("socket-path", defaultSocketPath(), "path to the socket to listen on")
 	agentsDir     = flag.String("agents-dir", "/tmp", "directory where to look for running agents")
 	idleThreshold = flag.Duration("idle-threshold", defaultIdleThreshold, "prefer local agents if local keyboard/mouse activity within idle time")
+	connTimeout   = flag.Duration("conn-timeout", defaultConnTimeout, "Maximum time for an agent to approve a request")
 	logLevel      = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 )
 
@@ -246,9 +252,21 @@ func proxyConnection(client net.Conn, agent net.Conn) error {
 		}
 	}()
 
-	// Wait for both copies to finish
-	wg.Wait()
-	return nil
+	// Wait for either completion or timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-time.After(*connTimeout):
+		client.Close()
+		agent.Close()
+		return fmt.Errorf("connection timed out after 10 seconds")
+	case <-done:
+		return nil
+	}
 }
 
 func isLocalActive() bool {
