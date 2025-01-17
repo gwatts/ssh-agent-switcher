@@ -59,11 +59,13 @@ var (
 	agentsDir     = flag.String("agents-dir", "/tmp", "directory where to look for running agents")
 	idleThreshold = flag.Duration("idle-threshold", defaultIdleThreshold, "prefer local agents if local keyboard/mouse activity within idle time")
 	connTimeout   = flag.Duration("conn-timeout", defaultConnTimeout, "Maximum time for an agent to approve a request")
+	logFile       = flag.String("log-file", "", "Log filename to append to (defaults to stdout)")
 	logLevel      = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 )
 
 var (
 	addtlAgents arrayFlags
+	lf          *os.File = os.Stdout
 )
 
 func init() {
@@ -323,21 +325,58 @@ func handleConnection(client net.Conn) {
 	slog.Info("Closing client connection")
 }
 
-// setupSignals installs signal handlers to clean up files and ignores signals that we don't want
-// to cause us to exit.
-func setupSignals(socketPath string) {
-	// Prevent terminal disconnects from killing this process if started in the background.
-	signal.Ignore(syscall.SIGHUP)
-
-	// Clean up the socket we create on exit.
+func setupSignals(socketPath string, ln net.Listener) {
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	// Watch SIGHUP, SIGINT, and SIGTERM:
+	signal.Notify(c, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+
 	go func() {
-		<-c
-		slog.Info("Shutting down due to signal and deleting listen socket",
-			slog.String("socket_path", socketPath))
-		os.Remove(socketPath)
-		os.Exit(1)
+		for sig := range c {
+			switch sig {
+			case syscall.SIGHUP:
+				slog.Info("Received SIGHUP: preparing for reload.")
+
+				// First, get the current executable (which might be updated).
+				exe, err := os.Executable()
+				if err != nil {
+					slog.Error("Unable to get current executable; skipping reload", "error", err)
+					// If we can’t find our own executable, do NOT proceed to remove the socket.
+					// We just log and continue running in the current process.
+					continue
+				}
+
+				// Optionally, check that it exists and is executable.
+				if st, err := os.Stat(exe); err != nil {
+					slog.Error("Cannot stat current executable; skipping reload", "error", err)
+					continue
+				} else if st.Mode()&0111 == 0 {
+					slog.Error("Executable bit not set on binary; skipping reload")
+					continue
+				}
+
+				// If we get here, we can re-exec ourselves safely.
+				slog.Info("Closing listener and removing socket before exec()",
+					slog.String("socket_path", socketPath))
+				ln.Close()
+				os.Remove(socketPath)
+
+				slog.Info("Exec", slog.String("exe", exe), slog.Any("args", os.Args))
+				err = syscall.Exec(exe, os.Args, os.Environ())
+				//err = errors.New("skip")
+				// If Exec() fails, the process will continue here:
+				if err != nil {
+					slog.Error("Failed to re-exec process", "error", err)
+					os.Exit(1)
+				}
+
+			case syscall.SIGINT, syscall.SIGTERM:
+				slog.Info("Shutting down due to signal; removing socket",
+					slog.String("socket_path", socketPath))
+				ln.Close()
+				os.Remove(socketPath)
+				os.Exit(1)
+			}
+		}
 	}()
 }
 
@@ -366,15 +405,19 @@ func main() {
 		usage()
 	}
 
-	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	if *logFile != "" && *logFile != "-" {
+		var err error
+		lf, err = os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open logfile for write: %v", err)
+		}
+	}
+
+	handler := slog.NewTextHandler(lf, &slog.HandlerOptions{
 		// Set level from flag
 		Level: parseLogLevel(*logLevel),
 	})
-	slog.SetDefault(slog.New(handler))
-
-	// Install signal handlers before we create the socket so that we don't leave it
-	// behind in any case.
-	setupSignals(*socketPath)
+	slog.SetDefault(slog.New(handler).With(slog.Int("pid", os.Getpid())))
 
 	// Ensure the socket is not group nor world readable so that we don't expose the
 	// real socket indirectly to other users.
@@ -386,8 +429,14 @@ func main() {
 	}
 	slog.Info("Listening", slog.String("socket_path", *socketPath))
 
+	setupSignals(*socketPath, socket)
+
 	for {
 		conn, err := socket.Accept()
+		if errors.Is(err, net.ErrClosed) {
+			slog.Info("Listener closed; waiting for syscall.Exec or exit.")
+			select {} // block; signal handler will shutdown
+		}
 		if err != nil {
 			slog.Error("Socket accept failed", slog.Any("error", err))
 			os.Exit(1)
