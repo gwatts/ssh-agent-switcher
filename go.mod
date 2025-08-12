@@ -1,3 +1,3 @@
-module ssh-agent-switcher
+module github.com/gwatts/ssh-agent-switcher
 
 go 1.22
