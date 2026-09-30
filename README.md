@@ -56,13 +56,7 @@ mkdir -p ~/.local/bin/
 cp ssh-agent-switcher ~/.local/bin/
 ```
 
-Or you can use Bazel:
-
-```sh
-bazel build -c opt //:ssh-agent-switcher
-mkdir -p ~/.local/bin/
-cp bazel-bin/ssh-agent-switcher_/ssh-agent-switcher ~/.local/bin/
-```
+Run the tests with `go test ./...`.
 
 ## Usage
 

@@ -3,20 +3,15 @@ name: Test
 on: [push, pull_request]
 
 jobs:
-    bazel-test:
-        runs-on: ubuntu-latest
+    go-test:
+        strategy:
+            matrix:
+                os: [ubuntu-latest, macos-latest]
+        runs-on: ${{ matrix.os }}
         steps:
             - uses: actions/checkout@v4
-            - uses: actions/cache@v3
+            - uses: actions/setup-go@v5
               with:
-                  path: ~/.cache/bazelisk
-                  key: ${{ runner.os }}--${{ hashFiles('**/.bazelversion') }}
-            - uses: bazelbuild/setup-bazelisk@v2
-            - run: bazel test --test_output=streamed //:all
-
-    go-build:
-        runs-on: ubuntu-latest
-        steps:
-            - uses: actions/checkout@v4
-            - run: go build
-            - run: ./ssh-agent-switcher -h 2>&1 | grep 'Usage of'
+                  go-version-file: go.mod
+            - run: go vet ./...
+            - run: go test -race ./...
