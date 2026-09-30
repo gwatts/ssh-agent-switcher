@@ -105,24 +105,30 @@ func clientOrigins(client net.Conn) []netip.Addr {
 	return addrs
 }
 
-// forwardedFrom reports whether the forwarded agent socket named name, which sshd names
-// "agent.<sshd pid>", belongs to an sshd session connected to one of hosts.
+// forwardedFrom reports whether the forwarded agent socket named name belongs to an sshd
+// session connected to one of hosts.
 func forwardedFrom(name string, hosts []netip.Addr) bool {
 	if len(hosts) == 0 {
 		return false
 	}
-	pid, err := strconv.Atoi(strings.TrimPrefix(name, "agent."))
+	addrs, err := agentOrigins(name)
 	if err != nil {
-		return false
-	}
-	addrs, err := remoteAddrs(pid)
-	if err != nil {
-		slog.Debug("failed to get sshd remote addresses", slog.Int("sshd_pid", pid), slog.Any("error", err))
+		slog.Debug("failed to get forwarded agent origins", slog.String("name", name), slog.Any("error", err))
 		return false
 	}
 	return slices.ContainsFunc(addrs, func(a netip.Addr) bool {
 		return slices.Contains(hosts, a)
 	})
+}
+
+// agentOrigins returns the remote hosts of the sshd session that owns the forwarded agent
+// socket named name, which sshd names "agent.<sshd pid>".
+func agentOrigins(name string) ([]netip.Addr, error) {
+	pid, err := strconv.Atoi(strings.TrimPrefix(name, "agent."))
+	if err != nil {
+		return nil, fmt.Errorf("unexpected agent socket name %q", name)
+	}
+	return remoteAddrs(pid)
 }
 
 // remoteAddrs returns the remote addresses of the established TCP connections held by process

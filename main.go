@@ -61,6 +61,7 @@ var (
 	agentsDir     = flag.String("agents-dir", "/tmp", "directory where to look for running agents")
 	idleThreshold = flag.Duration("idle-threshold", defaultIdleThreshold, "prefer local agents if local keyboard/mouse activity within idle time")
 	connTimeout   = flag.Duration("conn-timeout", defaultConnTimeout, "Maximum time for an agent to approve a request")
+	peerPort      = flag.Int("peer-port", 0, "TCP port on which to share idle time with switchers on other machines, and to query theirs (0 disables)")
 	logFile       = flag.String("log-file", "", "Log filename to append to (defaults to stdout)")
 	logLevel      = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 )
@@ -289,12 +290,28 @@ func closeWrite(conn net.Conn) {
 	}
 }
 
-func isLocalActive() bool {
+// preferLocal reports whether local agents should be preferred over forwarded ones because the
+// user appears to be at this machine.  Agents forwarded from hosts in avoid are not candidates.
+func preferLocal(avoid []netip.Addr) bool {
 	idleTime, err := getIdleTime()
 	if err != nil {
 		slog.Debug("failed to get local user idle time", slog.Any("error", err))
 		return false
 	}
+
+	if *peerPort != 0 {
+		peerIdle, err := minPeerIdleTime(forwardedOrigins(*agentsDir, avoid), *peerPort)
+		if err == nil {
+			prefer := idleTime <= peerIdle
+			slog.Info("compared idle time with peers",
+				slog.Bool("prefer_local", prefer),
+				slog.Duration("current_idle_time", idleTime),
+				slog.Duration("peer_idle_time", peerIdle))
+			return prefer
+		}
+		slog.Debug("falling back to idle threshold", slog.Any("reason", err))
+	}
+
 	isActive := idleTime < *idleThreshold
 	slog.Info("detected local user idle status",
 		slog.Bool("is_active", isActive),
@@ -358,7 +375,7 @@ func dialAgent(avoid []netip.Addr) net.Conn {
 		func() (net.Conn, error) { return findAgentSocket(*agentsDir, avoid) },
 		dialLocalAgent,
 	}
-	if len(addtlAgents) > 0 && isLocalActive() {
+	if len(addtlAgents) > 0 && preferLocal(avoid) {
 		slices.Reverse(dialers)
 	}
 
@@ -491,6 +508,10 @@ func main() {
 	slog.Info("Listening", slog.String("socket_path", *socketPath))
 
 	setupSignals(*socketPath, socket)
+
+	if *peerPort != 0 {
+		go servePeerIdle(*peerPort)
+	}
 
 	for {
 		conn, err := socket.Accept()

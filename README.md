@@ -28,6 +28,23 @@ local agents (such as the one provided by [1Password's ssh agent](https://develo
 which will be used if a local user is detected as active based on
 keyboard/mouse activity.
 
+### Running on several machines
+
+If you run ssh-agent-switcher on two machines and have `ssh -A` sessions open
+in both directions, each machine sees an agent forwarded from the other.  The
+switcher detects requests relayed by a local ssh client on behalf of another
+host (via the `session-bind@openssh.com` message that OpenSSH 8.9+ sends for
+forwarded agent channels) and never sends them back to an agent forwarded from
+that same host, which would otherwise loop and hang the ssh connection.
+
+The keyboard/mouse idle threshold is evaluated independently on each machine,
+so if both have been idle for a while neither is considered active.  To pick
+the machine you are actually at, pass the same `-peer-port` on each machine:
+the switchers then serve their idle time to each other over HTTP on that port
+(on all interfaces; nothing but the idle time is exposed) and prefer whichever
+machine had input most recently, falling back to the threshold if the peer
+cannot be reached.
+
 ## Installation
 
 ssh-agent-switcher is written in Go and has no dependencies.  You can build it
