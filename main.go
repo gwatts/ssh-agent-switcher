@@ -32,9 +32,11 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -125,7 +127,7 @@ func defaultSocketPath() string {
 //
 // This tries all possible files in search for a socket and only returns an error if no valid
 // and alive candidate can be found.
-func findAgentSocketSubdir(dir string) (net.Conn, error) {
+func findAgentSocketSubdir(dir string, avoid []netip.Addr) (net.Conn, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -136,6 +138,10 @@ func findAgentSocketSubdir(dir string) (net.Conn, error) {
 
 		if !strings.HasPrefix(entry.Name(), "agent.") {
 			slog.Debug("Ignoring filename that does not start with \"agent.\"", slog.String("path", path))
+			continue
+		}
+		if forwardedFrom(entry.Name(), avoid) {
+			slog.Info("Ignoring agent forwarded from the requesting host to avoid a loop", slog.String("path", path))
 			continue
 		}
 		conn, err := checkSocket(path)
@@ -173,8 +179,9 @@ func checkSocket(path string) (net.Conn, error) {
 // an agent, opens the agent's socket, and returns the connection to the agent.
 //
 // This tries all possible directories in search for a socket and only returns an error if
-// no valid and alive candidate can be found.
-func findAgentSocket(dir string) (net.Conn, error) {
+// no valid and alive candidate can be found.  Agents forwarded by sshd sessions connected to any
+// of the hosts in "avoid" are skipped.
+func findAgentSocket(dir string, avoid []netip.Addr) (net.Conn, error) {
 	// It is tempting to use the *at family of system calls to avoid races when checking for
 	// file metadata before opening the socket... but there is no guarantee that the sshd
 	// instance will be present at all even after we open the socket, so the races don't
@@ -221,7 +228,7 @@ func findAgentSocket(dir string) (net.Conn, error) {
 			continue
 		}
 
-		agent, err := findAgentSocketSubdir(path)
+		agent, err := findAgentSocketSubdir(path, avoid)
 		if err != nil {
 			slog.Debug("Ignoring path", slog.String("path", path), slog.Any("reason", err))
 			continue
@@ -244,6 +251,8 @@ func proxyConnection(client net.Conn, agent net.Conn) error {
 		if _, err := io.Copy(agent, client); err != nil && !errors.Is(err, io.EOF) {
 			slog.Warn("client→agent copy error", "error", err)
 		}
+		// Propagate the EOF so the agent closes its side instead of waiting for the timeout.
+		closeWrite(agent)
 	}()
 
 	// Copy agent → client
@@ -252,6 +261,7 @@ func proxyConnection(client net.Conn, agent net.Conn) error {
 		if _, err := io.Copy(client, agent); err != nil && !errors.Is(err, io.EOF) {
 			slog.Warn("agent→client copy error", "error", err)
 		}
+		closeWrite(client)
 	}()
 
 	// Wait for either completion or timeout
@@ -265,9 +275,17 @@ func proxyConnection(client net.Conn, agent net.Conn) error {
 	case <-time.After(*connTimeout):
 		client.Close()
 		agent.Close()
-		return fmt.Errorf("connection timed out after 10 seconds")
+		return fmt.Errorf("connection timed out after %v", *connTimeout)
 	case <-done:
 		return nil
+	}
+}
+
+// closeWrite shuts down the writing side of conn, if supported.  This is best effort: the
+// connection may already have been closed by the timeout.
+func closeWrite(conn net.Conn) {
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
 	}
 }
 
@@ -291,38 +309,81 @@ func handleConnection(client net.Conn) {
 	slog.Info("Accepted client connection")
 	defer client.Close()
 
-	var agent net.Conn
-	var err error
-
-	agent, err = findAgentSocket(*agentsDir)
+	// Read the first request to find out whether the client is an ssh process relaying a
+	// forwarded agent channel.  It is replayed to whichever agent is chosen.
+	if err := client.SetReadDeadline(time.Now().Add(*connTimeout)); err != nil {
+		slog.Warn("Failed to set read deadline", slog.Any("error", err))
+	}
+	first, err := readAgentMessage(client)
 	if err != nil {
-		slog.Info("Dropping find connection", slog.Any("reason", err))
+		slog.Info("Dropping connection: failed to read request", slog.Any("error", err))
+		return
 	}
-
-	if agent == nil || isLocalActive() {
-		for _, path := range addtlAgents {
-			localAgent, err := checkSocket(path)
-			if err == nil {
-				agent = localAgent
-				slog.Info("Using local agent")
-				break
-			}
-			slog.Warn("Additional local socket check failed",
-				slog.String("path", path), slog.Any("error", err))
-		}
-	}
-
-	if agent == nil {
+	if err := client.SetReadDeadline(time.Time{}); err != nil {
+		slog.Info("Dropping connection: failed to clear read deadline", slog.Any("error", err))
 		return
 	}
 
+	// A forwarded request came from the host the ssh client is connected to; sending it to an
+	// agent forwarded from that same host would just bounce it back.
+	var avoid []netip.Addr
+	if isForwardingBind(first) {
+		avoid = clientOrigins(client)
+		slog.Info("Client is relaying a forwarded agent channel", slog.Any("origins", avoid))
+	}
+
+	agent := dialAgent(avoid)
+	if agent == nil {
+		slog.Info("Dropping connection: no agent available")
+		return
+	}
 	defer agent.Close()
+
+	if _, err := agent.Write(first); err != nil {
+		slog.Info("Dropping connection: failed to write request to agent", slog.Any("error", err))
+		return
+	}
 
 	if err := proxyConnection(client, agent); err != nil {
 		slog.Info("Dropping proxy connection", slog.Any("error", err))
 		return
 	}
 	slog.Info("Closing client connection")
+}
+
+// dialAgent connects to a forwarded agent or one of the local agents, preferring the local
+// agents while the local user is active.  Returns nil if no agent is available.
+func dialAgent(avoid []netip.Addr) net.Conn {
+	dialers := []func() (net.Conn, error){
+		func() (net.Conn, error) { return findAgentSocket(*agentsDir, avoid) },
+		dialLocalAgent,
+	}
+	if len(addtlAgents) > 0 && isLocalActive() {
+		slices.Reverse(dialers)
+	}
+
+	for _, dial := range dialers {
+		agent, err := dial()
+		if err == nil {
+			return agent
+		}
+		slog.Info("Agent unavailable", slog.Any("reason", err))
+	}
+	return nil
+}
+
+// dialLocalAgent connects to the first available agent given with -local-agent.
+func dialLocalAgent() (net.Conn, error) {
+	for _, path := range addtlAgents {
+		agent, err := checkSocket(path)
+		if err == nil {
+			slog.Info("Using local agent")
+			return agent, nil
+		}
+		slog.Warn("Additional local socket check failed",
+			slog.String("path", path), slog.Any("error", err))
+	}
+	return nil, errors.New("no local agent available")
 }
 
 func setupSignals(socketPath string, ln net.Listener) {
